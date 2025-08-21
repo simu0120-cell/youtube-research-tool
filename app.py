@@ -1,11 +1,13 @@
-# app.py — YouTube 탐색 & 대량 비교 (1단계 업그레이드 반영본)
-# - Streamlit Cloud: Settings > Secrets 에 YT_API_KEY="..." 저장
-# - 로컬 실행: 환경변수 YT_API_KEY 설정 후 `streamlit run app.py`
+# app.py — YouTube 탐색 & 대량 비교 (1단계 + 날짜확장 2단계 통합본)
+# Secrets 또는 환경변수에 YT_API_KEY 설정 필요:
+#   Streamlit Cloud: Settings > Secrets 에 YT_API_KEY="..." 저장
+#   로컬: PowerShell  ->  setx YT_API_KEY "..." (새 창 열기)
+#         mac/linux  ->  export YT_API_KEY="..."
 
 import os
 import math
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 import pandas as pd
 import streamlit as st
@@ -13,13 +15,12 @@ from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from youtube_transcript_api import YouTubeTranscriptApi, TranscriptsDisabled, NoTranscriptFound
 
+# -----------------------------
+# 공통 상수/유틸
+# -----------------------------
 KST = timezone(timedelta(hours=9))
 
-# -----------------------------
-# 기본 유틸
-# -----------------------------
 def get_api_key() -> str:
-    # Streamlit Cloud 권장: st.secrets
     key = st.secrets.get("YT_API_KEY") if hasattr(st, "secrets") else None
     if not key:
         key = os.environ.get("YT_API_KEY", "").strip()
@@ -28,7 +29,7 @@ def get_api_key() -> str:
 def build_youtube():
     key = get_api_key()
     if not key:
-        st.error("API 키가 없습니다. Streamlit Secrets에 `YT_API_KEY=\"...\"` 를 저장하거나, 환경변수로 설정하세요.")
+        st.error("API 키가 없습니다. Streamlit Secrets에 `YT_API_KEY=\"...\"` 를 저장하거나 환경변수로 설정하세요.")
         st.stop()
     return build('youtube', 'v3', developerKey=key)
 
@@ -59,7 +60,12 @@ def safe_int(x) -> int:
         return 0
 
 def calc_cii(row: pd.Series, now: datetime) -> float:
-    # CII = 참여도(좋아요+댓글×3 / 조회수) × 채널규모(log10(구독자+1)) × 신선도(exp(-일수/30)) × 100
+    """
+    CII(가중 반응지표) = 참여도 × 채널규모 × 신선도 × 100
+      - 참여도 e = (좋아요 + 3*댓글) / 조회수
+      - 채널규모 b = log10(구독자+1)
+      - 신선도 f = exp(-일수/30)
+    """
     views = max(1, safe_int(row.get('view_count', 0)))
     likes = safe_int(row.get('like_count', 0))
     comments = safe_int(row.get('comment_count', 0))
@@ -78,21 +84,43 @@ def pick_duration(label: str) -> str:
     return {"전체":"any","4분 미만":"short","4~20분":"medium","20분 이상":"long"}.get(label, "any")
 
 def pick_order(label: str) -> str:
-    # 내부 API용(검색 단계) — UI 정렬에는 CII 옵션이 따로 있음
+    # 검색 API용 정렬 매핑(화면 정렬은 별도)
     return {"조회수(내림차순)":"viewCount","최근 업로드":"date","관련성":"relevance","평점":"rating"}.get(label, "viewCount")
 
 def start_of_this_month_kst() -> datetime:
     now = datetime.now(KST)
-    return datetime(now.year, now.month, 1, tzinfo=KST)
+    return datetime(now.year, now.month, 1, 0, 0, 0, tzinfo=KST)
+
+# === 날짜 확장용 헬퍼 ===
+def start_of_this_year_kst() -> datetime:
+    now = datetime.now(KST)
+    return datetime(now.year, 1, 1, 0, 0, 0, tzinfo=KST)
+
+def start_of_today_kst() -> datetime:
+    now = datetime.now(KST)
+    return datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=KST)
+
+def start_of_this_week_kst() -> datetime:
+    # 한국 기준 월요일 00:00
+    now = datetime.now(KST)
+    monday = now - timedelta(days=now.weekday())  # 0=월요일
+    return datetime(monday.year, monday.month, monday.day, 0, 0, 0, tzinfo=KST)
 
 def to_rfc3339(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).isoformat().replace('+00:00','Z')
 
+def now_utc_rfc3339() -> str:
+    return datetime.now(timezone.utc).isoformat().replace('+00:00','Z')
+
 # -----------------------------
 # API 호출
 # -----------------------------
-def search_video_ids(client, q: str, max_results: int, order: str, published_after: str, video_duration: str) -> List[str]:
-    ids = []
+def search_video_ids(
+    client, q: str, max_results: int, order: str,
+    published_after: str, video_duration: str,
+    published_before: Optional[str] = None
+) -> List[str]:
+    ids: List[str] = []
     page_token = None
     try:
         while len(ids) < max_results:
@@ -101,6 +129,7 @@ def search_video_ids(client, q: str, max_results: int, order: str, published_aft
                 maxResults=min(50, max_results - len(ids)),
                 order=order,
                 publishedAfter=published_after if published_after else None,
+                publishedBefore=published_before if published_before else None,  # ← 상한(현재시간) 적용
                 videoDuration=video_duration if video_duration != 'any' else None,
                 safeSearch='none'
             )
@@ -121,6 +150,7 @@ def search_video_ids(client, q: str, max_results: int, order: str, published_aft
 def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
     rows = []
     ch_ids = set()
+
     # videos
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i+50]
@@ -154,7 +184,7 @@ def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFram
     df = pd.DataFrame(rows)
 
     # channels
-    channels = {}
+    channels: Dict[str, Dict[str, Any]] = {}
     if ch_ids:
         ids = list(ch_ids)
         for i in range(0, len(ids), 50):
@@ -195,15 +225,19 @@ def enrich_dataframe(df: pd.DataFrame, channels: Dict[str, Dict[str, Any]]) -> p
 # UI
 # -----------------------------
 st.set_page_config(page_title="YouTube 탐색 & 비교", layout="wide")
-st.title("YouTube 탐색 & 대량 비교 (1단계 업그레이드)")
-st.caption("키워드로 영상을 탐색하고, 한글 지표/정렬/다운로드/자막 일괄 수집까지 지원합니다.")
+st.title("YouTube 탐색 & 대량 비교 (1단계 + 날짜확장 2단계)")
+st.caption("한글 지표/정렬/다운로드/자막 일괄 수집 + 기간 확장(올해/이번달/이번주/최근7일/오늘)")
 
 with st.sidebar:
     st.subheader("검색 조건")
     keyword = st.text_input("키워드", value="쿠팡꿀템")
-    uploaded_when = st.selectbox("업로드 시기", ["이번달","최근 7일","제한 없음"], index=0)
+    uploaded_when = st.selectbox(
+        "업로드 시기",
+        ["올해", "이번달", "이번주", "최근 7일", "오늘", "제한 없음"],
+        index=1  # 기본: 이번달
+    )
     duration_label = st.selectbox("영상 길이", ["전체","4분 미만","4~20분","20분 이상"], index=1)
-    # ⭐ 정렬 옵션에 CII(내림차순) 포함
+    # 화면 정렬: CII 포함
     order = st.selectbox("정렬", ["조회수(내림차순)", "최근 업로드", "CII(내림차순)"], 0)
     max_results = st.slider("최대 결과 수", 10, 200, 50, 10)
     sample_take = st.number_input("한 번에 선택할 개수", 1, 50, 5, 1)
@@ -211,11 +245,28 @@ with st.sidebar:
 
 client = build_youtube()
 
+# === 날짜 범위 계산 ===
 published_after = ""
-if uploaded_when == "이번달":
-    published_after = to_rfc3339(start_of_this_month_kst())
+published_before = now_utc_rfc3339()  # 상한은 현재 시각
+
+if uploaded_when == "올해":
+    start_dt = start_of_this_year_kst()
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "이번달":
+    start_dt = start_of_this_month_kst()
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "이번주":
+    start_dt = start_of_this_week_kst()
+    published_after = to_rfc3339(start_dt)
 elif uploaded_when == "최근 7일":
-    published_after = to_rfc3339(datetime.now(KST) - timedelta(days=7))
+    start_dt = datetime.now(KST) - timedelta(days=7)
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "오늘":
+    start_dt = start_of_today_kst()
+    published_after = to_rfc3339(start_dt)
+else:  # 제한 없음
+    published_after = ""
+    published_before = None  # 상한 미적용
 
 if run:
     with st.spinner("검색 중..."):
@@ -223,9 +274,10 @@ if run:
             client=client,
             q=keyword,
             max_results=max_results,
-            order=pick_order(order),  # 검색 API용
+            order=pick_order(order),  # 검색 API용 정렬
             published_after=published_after,
-            video_duration=pick_duration(duration_label)
+            video_duration=pick_duration(duration_label),
+            published_before=published_before
         )
         if not ids:
             st.error("검색 결과가 없거나 API 오류가 발생했습니다. (API 키/권한/쿼터/필터 확인)")
@@ -241,7 +293,7 @@ if run:
             df["comment_per_mille"] = (df["comment_count"] / safe_views * 1000).round(2)  # 댓글/조회수(‰)
             df["channel_share_pct"] = df["channel_share_pct"].round(2)                    # 보기 좋은 소수 2자리
 
-        # ====== 정렬 적용 ======
+        # ====== 화면 정렬 적용 ======
         if not df.empty:
             if order == "조회수(내림차순)":
                 df = df.sort_values("view_count", ascending=False)
@@ -289,7 +341,8 @@ if run:
             st.markdown("---")
             st.subheader("선택한 영상 자막 일괄 수집")
             options = df["video_id"].tolist()
-            selected_ids = st.multiselect("자막을 수집할 영상 선택", options=options, default=options[:min(5, len(options))])
+            default_pick = options[:min(5, len(options))]
+            selected_ids = st.multiselect("자막을 수집할 영상 선택", options=options, default=default_pick)
             if st.button("선택 영상 자막 수집 → TXT 다운로드", type="primary"):
                 texts = []
                 for vid in selected_ids:

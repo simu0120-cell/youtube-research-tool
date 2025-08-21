@@ -268,16 +268,21 @@ if run:
             published_after=published_after,
             video_duration=pick_video_duration_filter(duration_label)
         )
+        # ids 가드: 결과가 없거나 API 오류일 때 중단
+if not ids:
+    st.error("검색 결과가 없거나 API 오류가 발생했습니다. (API 키/권한/쿼터/필터 확인)")
+    st.stop()
+
         df_raw, ch_map = fetch_videos_and_channels(client, ids)
         df = enrich_dataframe(df_raw, ch_map)
 
         # 정렬 적용
-        if order_label == "조회수(내림차순)":
-            df = df.sort_values("view_count", ascending=False)
-        elif order_label == "최근 업로드":
-            df = df.sort_values("published_at_dt", ascending=False)
-        else:
-            df = df.sort_values("CII", ascending=False)
+       if order_label == "조회수(내림차순)":
+        df = df.sort_values("view_count", ascending=False)
+    elif order_label == "최근 업로드":
+        df = df.sort_values("published_at_dt", ascending=False)
+    else:
+        df = df.sort_values("CII", ascending=False)
 
         st.success(f"가져온 영상 {len(df)}개")
         if not df.empty:

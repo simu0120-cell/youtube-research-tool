@@ -92,7 +92,7 @@ def channel_contribution(df: pd.DataFrame) -> Dict[str, float]:
     counts = df['channel_title'].value_counts(dropna=False)
     return {ch: (counts.get(ch, 0) / K) * 100.0 for ch in counts.index}
 
-@st.cache_data(show_spinner=False)
+
 def search_video_ids(client, q: str, max_results: int, order: str, published_after: str, video_duration: str) -> List[str]:
     ids = []
     page_token = None
@@ -121,7 +121,7 @@ def search_video_ids(client, q: str, max_results: int, order: str, published_aft
             break
     return ids
 
-@st.cache_data(show_spinner=False)
+
 def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
     rows = []
     ch_ids = set()

@@ -1,14 +1,9 @@
-# app.py — 최소 쿼터/최소 비용 최적화 버전
-# 특징:
-# - 저쿼터 모드(기본 ON): 확장검색 자동 OFF, 결과 50개 자동 제한
-# - 캐시(st.cache_data, 1시간): 같은 조건 재검색 시 API 호출 0
-# - 큰 캔버스 표(내부 스크롤 최소화), CSV 다운로드
-# - 정렬: 조회수/최근 업로드/관련성
-# - 한글 지표 + 썸네일(고화질 우선) + 영상 링크
-# - quotaExceeded(403) 한국어 친절 안내
+# app.py — 대표님 전용 유튜브 분석기 (최신 최종본)
+# 기능: 기간(올해/이번달/이번주/최근7일/오늘/무제한), 확장검색, 한글지표,
+#      CII/좋아요율/댓글율/채널점유율, 썸네일 이미지, 영상 링크, 미리보기, CSV, 자막 일괄 수집
 
 import os
-from math import ceil
+import math
 from datetime import datetime, timedelta, timezone
 from typing import List, Dict, Any, Tuple, Optional
 
@@ -16,14 +11,22 @@ import pandas as pd
 import streamlit as st
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
+from youtube_transcript_api import (
+    YouTubeTranscriptApi,
+    TranscriptsDisabled,
+    NoTranscriptFound,
+)
 
-# =========================
-# 공통/유틸
-# =========================
+# -----------------------------
+# 공통 상수/유틸
+# -----------------------------
 KST = timezone(timedelta(hours=9))
 
 def get_api_key() -> str:
-    """Secrets/환경변수에서 YT_API_KEY 또는 YOUTUBE_API_KEY 자동 인식"""
+    """
+    Secrets와 환경변수에서 모두 인식:
+      - YT_API_KEY  또는  YOUTUBE_API_KEY
+    """
     key = None
     try:
         key = st.secrets.get("YT_API_KEY") or st.secrets.get("YOUTUBE_API_KEY")
@@ -44,6 +47,7 @@ def build_youtube():
     return build("youtube", "v3", developerKey=get_api_key())
 
 def iso8601_to_seconds(iso: str) -> int:
+    # 'PT1H2M10S' → 초
     h = m = s = 0
     if not iso:
         return 0
@@ -71,15 +75,33 @@ def safe_int(x) -> int:
     except Exception:
         return 0
 
+def calc_cii(row: pd.Series, now: datetime) -> float:
+    """
+    CII(가중 반응지표) = 참여도 × 채널규모 × 신선도 × 100
+      - 참여도 e = (좋아요 + 3*댓글) / 조회수
+      - 채널규모 b = log10(구독자+1)
+      - 신선도 f = exp(-일수/30)
+    """
+    views = max(1, safe_int(row.get("view_count", 0)))
+    likes = safe_int(row.get("like_count", 0))
+    comments = safe_int(row.get("comment_count", 0))
+    e = (likes + 3 * comments) / views
+
+    subs = safe_int(row.get("channel_subscribers", 0))
+    b = math.log10(subs + 1) if subs >= 0 else 0.0
+
+    published_at = row.get("published_at_dt", now)
+    days = max(0.0, (now - published_at).total_seconds() / 86400.0)
+    f = math.exp(-days / 30.0)
+
+    return 100.0 * e * b * f
+
 def pick_duration(label: str) -> str:
     return {"전체": "any", "4분 미만": "short", "4~20분": "medium", "20분 이상": "long"}.get(label, "any")
 
 def pick_order(label: str) -> str:
-    return {
-        "조회수(내림차순)": "viewCount",
-        "최근 업로드": "date",
-        "관련성": "relevance",
-    }.get(label, "viewCount")
+    # 검색 API용 정렬 매핑(화면 정렬은 아래에서 별도 처리)
+    return {"조회수(내림차순)": "viewCount", "최근 업로드": "date", "관련성": "relevance", "평점": "rating"}.get(label, "viewCount")
 
 def start_of_this_month_kst() -> datetime:
     now = datetime.now(KST)
@@ -94,6 +116,7 @@ def start_of_today_kst() -> datetime:
     return datetime(now.year, now.month, now.day, 0, 0, 0, tzinfo=KST)
 
 def start_of_this_week_kst() -> datetime:
+    # 한국 기준 월요일 00:00
     now = datetime.now(KST)
     monday = now - timedelta(days=now.weekday())
     return datetime(monday.year, monday.month, monday.day, 0, 0, 0, tzinfo=KST)
@@ -104,10 +127,14 @@ def to_rfc3339(dt: datetime) -> str:
 def now_utc_rfc3339() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+# 확장 검색(다변형)
 def expand_queries(q: str) -> list[str]:
-    """확장 검색(다변형) — 저쿼터 모드 기본 OFF"""
     q = q.strip()
-    variants = [q, f"\"{q}\"", q.replace(" ", "")]
+    variants = [
+        q,
+        f"\"{q}\"",
+        q.replace(" ", ""),
+    ]
     tails = ["추천", "꿀템", "리뷰", "후기", "TOP", "Best", "모음", "가성비", "쇼츠"]
     for t in tails:
         variants.append(f"{q} {t}")
@@ -118,9 +145,9 @@ def expand_queries(q: str) -> list[str]:
             uniq.append(v)
     return uniq
 
-# =========================
+# -----------------------------
 # API 호출
-# =========================
+# -----------------------------
 def search_video_ids(
     client, q: str, max_results: int, order: str,
     published_after: str, video_duration: str,
@@ -153,16 +180,10 @@ def search_video_ids(
         st.warning(f"Search API 오류: {e}")
     return ids
 
-def _best_thumb(snippet_thumbs: dict) -> str:
-    return (
-        snippet_thumbs.get("high", {}).get("url")
-        or snippet_thumbs.get("medium", {}).get("url")
-        or snippet_thumbs.get("default", {}).get("url", "")
-    )
-
 def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFrame, Dict[str, Dict[str, Any]]]:
     rows = []
     ch_ids = set()
+
     # videos
     for i in range(0, len(video_ids), 50):
         batch = video_ids[i:i+50]
@@ -187,14 +208,15 @@ def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFram
                 "channel_title": sn.get("channelTitle", ""),
                 "title": sn.get("title", ""),
                 "published_at": sn.get("publishedAt", ""),
-                "thumbnail_url": _best_thumb(sn.get("thumbnails", {})),
+                "thumbnail_url": sn.get("thumbnails", {}).get("default", {}).get("url", ""),
                 "duration_iso": cd.get("duration", "PT0S"),
                 "view_count": safe_int(stc.get("viewCount", 0)),
                 "like_count": safe_int(stc.get("likeCount", 0)),
                 "comment_count": safe_int(stc.get("commentCount", 0)),
             })
     df = pd.DataFrame(rows)
-    # channels(구독자)
+
+    # channels (구독자)
     channels: Dict[str, Dict[str, Any]] = {}
     if ch_ids:
         ids = list(ch_ids)
@@ -217,47 +239,26 @@ def fetch_videos_and_channels(client, video_ids: List[str]) -> Tuple[pd.DataFram
 def enrich_dataframe(df: pd.DataFrame, channels: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
     if df.empty:
         return df
+    now = datetime.now(KST)
     df = df.copy()
     df["published_at_dt"] = pd.to_datetime(df["published_at"], errors="coerce")
     df["duration_sec"] = df["duration_iso"].apply(iso8601_to_seconds)
     df["duration_mmss"] = df["duration_sec"].apply(seconds_to_mmss)
     df["channel_subscribers"] = df["channel_id"].map(lambda x: channels.get(x, {}).get("subscribers", 0))
+    df["CII"] = df.apply(lambda r: calc_cii(r, now), axis=1)
+
     # 채널 점유율(%)
     counts = df["channel_title"].value_counts(dropna=False)
     share = {k: (counts[k] / len(df)) * 100.0 for k in counts.index}
     df["channel_share_pct"] = df["channel_title"].map(lambda x: share.get(x, 0.0))
     return df
 
-# =========================
-# 캐시(1시간)
-# =========================
-@st.cache_data(ttl=3600)
-def cached_search_ids(q, max_results, order, published_after, video_duration, published_before):
-    client = build_youtube()
-    return search_video_ids(client, q, max_results, order, published_after, video_duration, published_before)
-
-@st.cache_data(ttl=3600)
-def cached_fetch_videos_and_channels(video_ids):
-    client = build_youtube()
-    return fetch_videos_and_channels(client, video_ids)
-
-def estimate_quota_cost(num_queries:int, want:int, ch_count:int) -> int:
-    """대략적인 유닛 추정(감 잡기용)
-       search.list: 100유닛/호출(최대 50개/페이지)
-       videos.list: 1유닛/호출(최대 50개)
-       channels.list: 1유닛/호출(최대 50개)
-    """
-    search_pages = num_queries * ceil(max(1, want)/50)
-    video_calls  = ceil(max(1, want)/50)
-    ch_calls     = ceil(max(1, ch_count)/50)
-    return 100*search_pages + video_calls + ch_calls
-
-# =========================
+# -----------------------------
 # UI
-# =========================
+# -----------------------------
 st.set_page_config(page_title="대표님 전용 유튜브 분석기", layout="wide")
-st.title("YouTube 탐색 & 대량 비교 (최저 쿼터)")
-st.caption("캐시 + 저쿼터 모드 + 큰 캔버스 표 | 한글 지표 + 썸네일 + 링크 + CSV")
+st.title("YouTube 탐색 & 대량 비교 (최종본)")
+st.caption("기간 확장 + 확장검색 + 한글지표 + 썸네일/링크 + 미리보기 + CSV + 자막 일괄 수집")
 
 with st.sidebar:
     st.subheader("검색 조건")
@@ -266,137 +267,124 @@ with st.sidebar:
     uploaded_when = st.selectbox(
         "업로드 시기",
         ["올해", "이번달", "이번주", "최근 7일", "오늘", "제한 없음"],
-        index=1
+        index=1  # 기본: 이번달
     )
 
     duration_label = st.selectbox("영상 길이", ["전체", "4분 미만", "4~20분", "20분 이상"], index=1)
-    order = st.selectbox("정렬", ["조회수(내림차순)", "최근 업로드", "관련성"], 0)
+    order = st.selectbox("정렬", ["조회수(내림차순)", "최근 업로드", "CII(내림차순)"], 0)
 
-    # ✅ 기본값이 '절약'이 되도록 True
-    low_quota_mode = st.toggle("저쿼터 모드(쿼터 절약)", value=True,
-                               help="확장검색 OFF + 결과 자동 제한(≤50) + 호출 최소화")
-    expand_mode = st.checkbox("확장 검색(다변형)", value=False if low_quota_mode else True)
+    # 확장 검색(다변형)
+    expand_mode = st.checkbox("확장 검색(다변형)", value=True, help="따옴표/공백제거/연관단어 조합으로 더 많은 소스 수집")
 
-    # 저쿼터 모드면 UI 상의 최대 결과 수는 무시하고 50으로 제한됨
+    # 결과 수 상향
     max_results = st.slider("최대 결과 수", 10, 300, 100, 10)
 
+    sample_take = st.number_input("한 번에 선택할 개수", 1, 50, 5, 1)
     run = st.button("검색 실행", type="primary")
 
-# 날짜 범위 계산
-published_after = ""
-published_before = now_utc_rfc3339()
-if uploaded_when == "올해":
-    published_after = to_rfc3339(start_of_this_year_kst())
-elif uploaded_when == "이번달":
-    published_after = to_rfc3339(start_of_this_month_kst())
-elif uploaded_when == "이번주":
-    published_after = to_rfc3339(start_of_this_week_kst())
-elif uploaded_when == "최근 7일":
-    published_after = to_rfc3339(datetime.now(KST) - timedelta(days=7))
-elif uploaded_when == "오늘":
-    published_after = to_rfc3339(start_of_today_kst())
-else:
-    published_after = ""
-    published_before = None
+client = build_youtube()
 
-# =========================
-# RUN
-# =========================
+# === 날짜 범위 계산 ===
+published_after = ""
+published_before = now_utc_rfc3339()  # 상한은 현재 시각
+
+if uploaded_when == "올해":
+    start_dt = start_of_this_year_kst()
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "이번달":
+    start_dt = start_of_this_month_kst()
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "이번주":
+    start_dt = start_of_this_week_kst()
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "최근 7일":
+    start_dt = datetime.now(KST) - timedelta(days=7)
+    published_after = to_rfc3339(start_dt)
+elif uploaded_when == "오늘":
+    start_dt = start_of_today_kst()
+    published_after = to_rfc3339(start_dt)
+else:  # 제한 없음
+    published_after = ""
+    published_before = None  # 상한 미적용
+
+# -----------------------------
+# 실행
+# -----------------------------
 if run:
     with st.spinner("검색 중..."):
-        want = max_results
-        use_expand = expand_mode
-        if low_quota_mode:
-            use_expand = False
-            want = min(want, 50)
-            st.info("저쿼터 모드: 확장검색 OFF, 결과 수 50으로 제한합니다.")
-
-        try:
-            if use_expand:
-                queries = expand_queries(keyword)
-                ids_set = set()
-                per = max(10, want // max(1, len(queries)))
-                for qv in queries:
-                    if len(ids_set) >= want:
-                        break
-                    got = cached_search_ids(
-                        qv, min(per, want - len(ids_set)),
-                        pick_order(order),
-                        published_after,
-                        pick_duration(duration_label),
-                        published_before
-                    )
-                    ids_set.update(got)
-                ids = list(ids_set)[:want]
-                num_queries = len(queries)
-            else:
-                ids = cached_search_ids(
-                    keyword, want,
-                    pick_order(order),
-                    published_after,
-                    pick_duration(duration_label),
-                    published_before
+        # 확장 검색
+        if expand_mode:
+            queries = expand_queries(keyword)
+            want = max_results
+            ids_set: set[str] = set()
+            per = max(10, want // max(1, len(queries)))  # 쿼리당 최소 10개
+            for qv in queries:
+                if len(ids_set) >= want:
+                    break
+                got = search_video_ids(
+                    client=client,
+                    q=qv,
+                    max_results=min(per, want - len(ids_set)),
+                    order=pick_order(order),
+                    published_after=published_after,
+                    video_duration=pick_duration(duration_label),
+                    published_before=published_before,
                 )
-                num_queries = 1
+                ids_set.update(got)
+            ids = list(ids_set)[:want]
+        else:
+            ids = search_video_ids(
+                client=client,
+                q=keyword,
+                max_results=max_results,
+                order=pick_order(order),
+                published_after=published_after,
+                video_duration=pick_duration(duration_label),
+                published_before=published_before,
+            )
 
-            if not ids:
-                st.error("검색 결과가 없거나 API 오류가 발생했습니다.")
-                st.stop()
+        if not ids:
+            st.error("검색 결과가 없거나 API 오류가 발생했습니다. (API 키/권한/쿼터/필터 확인)")
+            st.stop()
 
-            # 대략 비용 추정(참고용)
-            rough_cost = estimate_quota_cost(num_queries, len(ids), ch_count=50)
-            st.caption(f"예상 쿼터 사용(대략): 약 {rough_cost} 유닛")
-
-            df_raw, ch_map = cached_fetch_videos_and_channels(ids)
-
-        except HttpError as e:
-            if "quotaExceeded" in str(e):
-                st.error(
-                    "YouTube Data API 쿼터가 소진되었습니다.\n"
-                    "🛠 해결 가이드:\n"
-                    " • ‘저쿼터 모드’ 켜기(권장)\n"
-                    " • ‘확장 검색’ 끄기\n"
-                    " • ‘최대 결과 수’를 30~50으로 낮추기\n"
-                    " • ‘업로드 시기’를 ‘최근 7일/오늘’로 좁히기\n"
-                    " • (가능하면) 다른 프로젝트의 API 키 사용 또는 쿼터 증설"
-                )
-                st.stop()
-            else:
-                st.error(f"API 오류: {e}")
-                st.stop()
-
-        # 가공
+        df_raw, ch_map = fetch_videos_and_channels(client, ids)
         df = enrich_dataframe(df_raw, ch_map)
+
+        # ===== 지표 컬럼 추가 =====
+        if not df.empty:
+            safe_views = df["view_count"].replace(0, 1)
+            df["like_rate_pct"] = (df["like_count"] / safe_views * 100).round(2)          # 좋아요/조회수(%)
+            df["comment_per_mille"] = (df["comment_count"] / safe_views * 1000).round(2)  # 댓글/조회수(‰)
+            df["channel_share_pct"] = df["channel_share_pct"].round(2)
+
+        # ===== 화면 정렬 =====
+        if not df.empty:
+            if order == "조회수(내림차순)":
+                df = df.sort_values("view_count", ascending=False)
+            elif order == "최근 업로드":
+                df = df.sort_values("published_at_dt", ascending=False)
+            elif order == "CII(내림차순)":
+                df = df.sort_values("CII", ascending=False)
+
+        st.success(f"가져온 영상 {len(df)}개")
+
         if df.empty:
             st.warning("표시할 데이터가 없습니다.")
             st.stop()
 
-        # 한글 지표
-        safe_views = df["view_count"].replace(0, 1)
-        df["like_rate_pct"] = (df["like_count"] / safe_views * 100).round(2)
-        df["comment_per_mille"] = (df["comment_count"] / safe_views * 1000).round(2)
-        df["channel_share_pct"] = df["channel_share_pct"].round(2)
-
-        # 화면 정렬
-        if order == "조회수(내림차순)":
-            df = df.sort_values("view_count", ascending=False)
-        elif order == "최근 업로드":
-            df = df.sort_values("published_at_dt", ascending=False)
-        # '관련성'은 API 순서 유지
-
-        st.success(f"가져온 영상 {len(df)}개")
-
-        # 표시용 DF
+        # ===== 표시용 DF 구성 =====
         show_cols = [
             "video_id","channel_title","title","published_at_dt",
             "channel_subscribers","view_count","like_count","comment_count",
             "like_rate_pct","comment_per_mille","duration_mmss",
-            "channel_share_pct","thumbnail_url"
+            "CII","channel_share_pct","thumbnail_url"
         ]
         nice_df = df[show_cols].copy()
         nice_df["영상 링크"] = "https://www.youtube.com/watch?v=" + nice_df["video_id"]
         nice_df["썸네일"] = nice_df["thumbnail_url"]
+
         nice_df = nice_df.rename(columns={
+            "video_id":"영상ID",
             "channel_title":"채널명",
             "title":"제목",
             "published_at_dt":"게시일",
@@ -407,32 +395,58 @@ if run:
             "like_rate_pct":"좋아요/조회수(%)",
             "comment_per_mille":"댓글/조회수(‰)",
             "duration_mmss":"영상 길이",
+            "CII":"CII",
             "channel_share_pct":"채널 점유율(%)",
         })
 
         display_cols = [
             "썸네일","영상 링크",
-            "채널명","제목","게시일",
+            "영상ID","채널명","제목","게시일",
             "구독자수","조회수","좋아요수","댓글수",
-            "좋아요/조회수(%)","댓글/조회수(‰)","영상 길이","채널 점유율(%)"
+            "좋아요/조회수(%)","댓글/조회수(‰)","영상 길이","CII","채널 점유율(%)"
         ]
-
-        # 큰 캔버스(페이지 스크롤 중심)
-        height = int(min(1800, 46 * (len(nice_df) + 2)))
-        if height < 600:
-            height = 600
 
         st.dataframe(
             nice_df[display_cols],
             use_container_width=True,
             hide_index=True,
-            height=height,
             column_config={
-                "썸네일": st.column_config.ImageColumn("썸네일", width=180),
+                "썸네일": st.column_config.ImageColumn("썸네일", width="small"),
                 "영상 링크": st.column_config.LinkColumn("영상 보기", display_text="열기"),
             },
         )
 
-        # CSV
+        # CSV 다운로드 (엑셀 호환: utf-8-sig)
         csv = nice_df[display_cols].to_csv(index=False).encode("utf-8-sig")
         st.download_button("현재 결과 CSV 다운로드", data=csv, file_name="youtube_results.csv")
+
+        # ===== 미리보기 =====
+        st.markdown("---")
+        st.subheader("영상 미리보기")
+        sel_options = (nice_df["제목"] + " | " + nice_df["채널명"] + " | " + nice_df["영상ID"]).tolist()
+        sel = st.selectbox("미리볼 영상 선택", options=["선택 안 함"] + sel_options, index=0)
+        if sel != "선택 안 함":
+            vid = sel.split("|")[-1].strip()
+            st.video(f"https://www.youtube.com/watch?v={vid}")
+
+        # ===== 자막 일괄 수집 / TXT 다운로드 =====
+        st.markdown("---")
+        st.subheader("선택한 영상 자막 일괄 수집")
+        options = df["video_id"].tolist()
+        default_pick = options[:min(5, len(options))]
+        selected_ids = st.multiselect("자막을 수집할 영상 선택", options=options, default=default_pick)
+        if st.button("선택 영상 자막 수집 → TXT 다운로드", type="primary"):
+            texts = []
+            for vid in selected_ids:
+                try:
+                    tr = YouTubeTranscriptApi.get_transcript(vid, languages=["ko","ko-KR","ko+en","en"])
+                    text = "\n".join([x.get("text","") for x in tr if x.get("text")])
+                except (TranscriptsDisabled, NoTranscriptFound):
+                    text = ""
+                except Exception:
+                    text = ""
+                texts.append({"video_id": vid, "caption": text})
+            txt = ""
+            for item in texts:
+                txt += f"=== {item['video_id']} ===\n{item['caption']}\n\n"
+            st.download_button("자막 TXT 다운로드", data=txt.encode("utf-8"), file_name="captions.txt")

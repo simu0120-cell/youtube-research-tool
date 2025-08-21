@@ -1,0 +1,4 @@
+streamlit>=1.36
+google-api-python-client>=2.131.0
+youtube-transcript-api>=0.6.2
+pandas>=2.2.2
